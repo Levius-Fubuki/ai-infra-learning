@@ -1,0 +1,8 @@
+*.out
+*.o
+hello
+bool_sum
+pointer_demo
+__pycache__/
+*.pyc
+EOF
