@@ -3,6 +3,10 @@
 hello
 bool_sum
 pointer_demo
+memory_demo
+vector_stats
+point
+vector_add
 __pycache__/
 *.pyc
 EOF
