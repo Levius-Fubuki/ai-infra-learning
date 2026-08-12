@@ -10,6 +10,9 @@ vector_add
 mergeTwoLists
 removeDuplicates
 twoSum
+print_ids
+reduce_atomic
+reduce_shared
 __pycache__/
 *.pyc
 EOF
