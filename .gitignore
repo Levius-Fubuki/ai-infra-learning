@@ -7,6 +7,9 @@ memory_demo
 vector_stats
 point
 vector_add
+mergeTwoLists
+removeDuplicates
+twoSum
 __pycache__/
 *.pyc
 EOF
