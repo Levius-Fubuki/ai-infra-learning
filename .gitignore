@@ -15,6 +15,7 @@ reduce_atomic
 reduce_shared
 matmul_naive
 matmul_tiled
+profile_demo
 __pycache__/
 *.pyc
 EOF
