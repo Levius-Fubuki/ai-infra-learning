@@ -16,6 +16,9 @@ reduce_shared
 matmul_naive
 matmul_tiled
 profile_demo
+matmul_regtile
+matmul_regtile-1
+matmul_regtile-2
 __pycache__/
 *.pyc
 EOF
