@@ -66,11 +66,13 @@ int main() {
     cudaMemcpy(d_A, h_A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice);
 
-    dim3 block(512);
+    dim3 block(2048);
     dim3 grid(N/BN, M/BM);
 
     // warmup
     matmul_regtile<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { printf("launch failed: %s\n", cudaGetErrorString(e)); return 1; }
     cudaDeviceSynchronize();
 
     cudaEvent_t start, stop;

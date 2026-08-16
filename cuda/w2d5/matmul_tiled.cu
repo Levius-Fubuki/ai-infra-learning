@@ -44,7 +44,7 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C,
 }
 
 int main() {
-    int M = 1024, N = 1024, K = 1024;
+    int M = 4096, N = 4096, K = 4096;
     vector<float> h_A(M * K), h_B(K * N), h_C(M * N);
     for (int i = 0; i < M * K; ++i) h_A[i] = (rand() % 100) / 100.0f;
     for (int i = 0; i < K * N; ++i) h_B[i] = (rand() % 100) / 100.0f;
