@@ -19,6 +19,7 @@ profile_demo
 matmul_regtile
 matmul_regtile-1
 matmul_regtile-2
+matmul_2d
 __pycache__/
 *.pyc
 EOF

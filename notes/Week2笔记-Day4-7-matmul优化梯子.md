@@ -46,7 +46,7 @@ nsys stats --report cuda_gpu_kern_sum --report cuda_gpu_mem_time_sum naive.nsys-
 | k2 | coalescing | 调整线程→数据映射,让相邻线程读相邻地址 | (我的 k1 写法已含半个 k2) | 1.99 | 半含 |
 | k3 | SMEM tiling | block 合伙把数据搬进共享内存再算 | **2.878**(8.1%) | 2.98 | ✅ 打平 |
 | k4 | 1D 寄存器分块 | 每线程算 TM=8 个 C,中间结果住寄存器 | **3.97**(11.2%) | 8.47 | ✅ 差距=k5/k6 的活 |
-| k5 | 2D 寄存器分块 | 每线程算 TM×TN=8×8 方块 | — | 15.97 | ⬅ 下一课 |
+| k5 | 2D 寄存器分块 | 每线程算 TM×TN=8×8 方块 | **8.57**(24.1%) | 15.97 | ✅ 已复现(见 §五之二) |
 | k6 | float4 向量化 | 一次装载 16 字节 | — | 18.24 | 之后 |
 | k9 | 自动调参 | 扫参数空间找最优配置 | — | 19.72 | 做过迷你版 |
 | k10 | warp 分块 | 块内再按 warp 切分 | — | 21.78 | 之后 |
@@ -79,6 +79,7 @@ FMA 计算单元
 | naive | 0.25 | 自有低帽(烂访问) | 0.515 | 0.514 | **不动** | 早已贴住自己的帽 |
 | tiled | 4 | 3.74 | 2.82 | 2.878 | **不动** | 贴带宽帽(77%),尺寸不改变贴墙事实 |
 | regtile | 16 | ~15 | 2.94 | **3.97** | **+35%** | 唯一动了的:小尺寸饿着,大尺寸吃到新帽 |
+| 2d(k5) | 32 | ~30 | 3.72 | **8.57** | **+130%** | 大方块吃满 AI;1024³ 仅 64 block<82 SM 不足 1 波,故只用来验证 |
 
 > [!tip] 尺寸方法论(一句话)
 > **Roofline 帽(强度)不随矩阵大小变;尺寸改变的只有一件事——你有没有足够的并行度(波数)去吃到帽。**
@@ -504,6 +505,129 @@ if (e != cudaSuccess) { printf("launch: %s\n", cudaGetErrorString(e)); return 1;
 
 ---
 
+## 五之二、延伸:`matmul_2d.cu`(k5:2D 寄存器分块)——Day7 当天完成
+
+Day7 收尾时顺手把梯子第 5 级也复现了:配置 **BM=BN=128, BK=8, TM=TN=8 → 256 线程**。
+
+**成绩**:
+
+| 尺寸 | 耗时 | TFLOPS | max\|err\| | 说明 |
+|---|---|---|---|---|
+| 1024³ | 0.578ms | 3.72 | 7.6e-5 PASS | grid 只有 8×8=**64 block < 82 SM,不足 1 波**(18 个 SM 全程闲置)——只配验证,不配跑分 |
+| 4096³ | 16.04ms | **8.57**(24.1%) | 3.05e-4 PASS | grid 32×32=1024 block ≈ 12 波 |
+
+vs k4(3.97)= **2.16×**(文章 k4→k5 为 1.89×,我们跳幅还大些);vs naive(0.514)= **16.7×**;与文章的比值从 k4 的 47% 收窄到 k5 的 **54%**。
+
+### 1. 动机:Q4 的账终于解开
+
+```
+想上 128×128 大方块(AI = 32,骑在平衡点 38 附近):
+  每线程 1 个输出    → 16384 线程 > 1024 ✕
+  每线程 8 个(1D)   → 2048 线程 > 1024 ✕(Day7 实验 3 撞的墙)
+  每线程 8×8=64 个   → 16384/64 = 256 线程 ✔
+```
+
+### 2. 核心:双向复用(k4 只有单向)
+
+k4 里取 1 个 `a` 连用 8 次;k5 里**一列 a 和一行 b 同时喂 64 条 FMA**:
+
+```
+线程的小方块(8×8),第 kk 步:
+         b[0]  b[1] ... b[7]      ← 8 次 SMEM 读(一行)
+        ┌────────────────┐
+  a[0]  │ ●    ●   ...  ●│
+  a[1]  │ ●    ●   ...  ●│       ← 8 次 SMEM 读(一列)
+   ⋮    │ ⋮              │
+  a[7]  │ ●    ●   ...  ●│
+        └────────────────┘
+  64 条 FMA 只用 16 次 SMEM 读 → load:FMA = 1:4(k4 是 1:1)
+```
+
+寄存器:`acc[8][8]`=64 + a/b=16 ≈ 80 个(上限 255,安全)。
+
+### 3. 逐行精读(修正版)
+
+```cuda
+__shared__ float As[128][8];   // BM×BK
+__shared__ float Bs[8][128];   // BK×BN
+
+const int threadRow = threadIdx.x / (BN / TN);          // tid/16 → 0..15(第几个方块行)
+const int threadCol = (threadIdx.x % (BN / TN)) * TN;   // (tid%16)×8 → 0,8,…,120
+const int globalRow = blockIdx.y * BM + threadRow * TM; // ★ 方块行号 × TM 才是元素行号
+const int globalCol = blockIdx.x * BN + threadCol;
+
+float acc[TM][TN]; /* 清零 */
+for (int bk = 0; bk < K; bk += BK) {
+    for (int i = threadIdx.x; i < BM*BK; i += blockDim.x)     // ① 跨步搬运:每人 4+4 个
+        As[i/BK][i%BK] = A[(blockIdx.y*BM + i/BK)*K + bk + i%BK];
+    for (int i = threadIdx.x; i < BK*BN; i += blockDim.x)
+        Bs[i/BN][i%BN] = B[(bk + i/BN)*N + blockIdx.x*BN + i%BN];
+    __syncthreads();
+    for (int kk = 0; kk < BK; ++kk) {
+        float a[TM], b[TN];
+        for (int r = 0; r < TM; ++r) a[r] = As[threadRow*TM + r][kk];   // ★ 取一列
+        for (int c = 0; c < TN; ++c) b[c] = Bs[kk][threadCol + c];      // ★ 取一行
+        for (int r = 0; r < TM; ++r)                                      // ② 64 条 FMA
+            for (int c = 0; c < TN; ++c)
+                acc[r][c] += a[r] * b[c];
+    }
+    __syncthreads();
+}
+for (int r = 0; r < TM; ++r)                                              // ③ 二维写回
+    for (int c = 0; c < TN; ++c)
+        C[(globalRow+r)*N + globalCol+c] = acc[r][c];
+```
+
+与 k4 的三处结构差异:
+- **线程映射二维化**:256 人铺 128×128,每行 16 人(BN/TN),每人管 8×8;
+- **搬运跨步循环**:As/Bs 各 1024 个数、256 人 → 每人 4 个(`for + blockDim.x` 步进)——这是**线程数少于数据量时的标准装载写法**,比 k4 的"正好一人一个"通用;
+- **写回二维**:8×8 一次写出。
+
+### 4. 具体数字全程走一遍(blockIdx=(1,2), threadIdx.x=37)
+
+```
+threadRow = 37/16 = 2          ← 第 2 号方块行(注意不是元素行!)
+threadCol = (37%16)×8 = 40     ← 方块左上角的列
+globalRow = 2×128 + 2×8 = 272  ← block 纵向偏移 256 + 方块行偏移 16
+globalCol = 1×128 + 40 = 168
+→ 本线程负责 C[272..279][168..175] 共 64 个数
+
+装载(tid=37, bk=0,第一趟 i=37):
+  As[37/8][37%8] = As[4][5] ← A[(2×128 + 4)×K + 0 + 5] = A[260][5]
+  Bs[37/128][37%128] = Bs[0][37] ← B[(0+0)×N + 1×128 + 37] = B[0][165]
+
+计算(kk=3):
+  a[r] = As[2×8+r][3] = As[16..23][3] = A[272+r][3]
+  b[c] = Bs[3][40+c] = B[3][168+c]
+  acc[r][c] += a[r]×b[c]
+→ 加的正是 C[272+r][168+c] 点积中 k=3 那一项,一次 64 个 ✔
+```
+
+### 5. 调试实录:illegal memory access 三 bug(第一天写 k5 全踩)
+
+首跑 `CUDA error: an illegal memory access was encountered`,定位工具:
+
+```bash
+nvcc -O3 -arch=sm_86 -lineinfo -o matmul_2d matmul_2d.cu   # -lineinfo:带上行号信息
+compute-sanitizer --tool memcheck ./matmul_2d               # 指认到具体 .cu 行号
+```
+
+| bug | 症状 | 根因 |
+|---|---|---|
+| ① Bs 装载用了 As 的索引公式 `Bs[i/BK][i%BK]` | **崩溃**:写 `Bs[127][x]` 偏移 ~65KB,而本 block shared 只有 8KB | As 是 `[128][8]`、Bs 是 `[8][128]`,**形状不同,索引公式各配各的**;i/BK 最大 127,对 Bs 第一维(上限 7)越界 16 倍 |
+| ② `As[threadRow + r][kk]` 少乘 TM | **静默错**:256 人只碰 As 的第 0~22 行,C 大片没人写(max\|err\| FAIL 抓到) | threadRow 是"第几个方块行"(0..15),×TM 才是元素行号(0..127) |
+| ③ 计算循环用 `BK` 冒充 TM/TN | 现在不炸(TM=TN=BK=8 恰好相等),autotune 改 BK=16 时静默错 | **常量名字是语义不是数字**:BK=k 切片深度,TM/TN=输出方块边长,三个概念 |
+
+教训:①崩溃用 sanitizer 秒定位;②③都不崩——**静默错只能靠全矩阵校验门拦**(又一次证明"先验证后跑分"不是口号)。
+
+### 6. 剩余瓶颈(为 k6/k10 留档)
+
+- **Bs 读 4-way bank conflict**:warp 内 16 个不同地址(列 0,8,…,120)按 8 float=32B 间隔落进 **4 个 bank、每 bank 4 个地址** → 每次 Bs 读耗 4 周期而非 1。Q5② "bank conflict 只发生在 warp 内"的活例;k10(warp 分块)/padding(k6)治它;
+- A 装载每 warp 4 笔 32B wavefront(k6 float4 修);
+- max\|err\| 随 K 线性涨(7.6e-5@K=1024 → 3.05e-4@K=4096)属浮点累加正常现象——**校验阈值应随规模放宽**。
+
+---
+
 ## 六、性能指标小抄(matmul 版,含本篇实测数)
 
 | 指标 | 公式 | 实例 |
@@ -512,11 +636,11 @@ if (e != cudaSuccess) { printf("launch: %s\n", cudaGetErrorString(e)); return 1;
 | TFLOPS | 2MNK / t | 137.4G / 34.63ms = **3.97** |
 | 利用率 | TFLOPS ÷ FP32 峰值 | 3.97/35.6 = 11.2% |
 | 算术强度 AI(block 级) | 2·BM·BN / (4·(BM+BN))(BK 消掉) | 16×16→4;64×64→16;128×128→32 |
-| 带宽帽 | AI × 936 GB/s | AI4→3.74;AI16→15 |
-| 贴墙判定 | 实测 ÷ 帽 | tiled 77%(贴);regtile 26%(没贴) |
+| 带宽帽 | AI × 936 GB/s | AI4→3.74;AI16→15;AI32→30 |
+| 贴墙判定 | 实测 ÷ 帽 | tiled 77%(贴);regtile 26%;2d 8.57/30=29% |
 | 平衡点 | 峰值算力 ÷ 峰值带宽 | 35.6T/936G ≈ 38 FLOP/B |
 | 波数 | 总 block ÷ 82 SM | 256/82≈3;4096/82≈50 |
-| 加速比 | t_旧 ÷ t_新 | naive→regtile = 267.4/34.63 ≈ **7.7×** |
+| 加速比 | t_旧 ÷ t_新 | naive→regtile = 267.4/34.63 ≈ **7.7×**;naive→2d = **16.7×** |
 | memops 占比 | memops ÷ (kernels+memops) | naive 11.4% → tiled 50.2% |
 | nsys StdDev | 样本标准差(÷n−1) | 2446.5×√2 = 3459.9 ✔ |
 
