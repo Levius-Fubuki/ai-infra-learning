@@ -16,16 +16,16 @@ def add_kernel(x_ptr, y_ptr, output_ptr,             # 门牌号:张量首地址
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)  # ⭐ 一次算一整块索引(向量!)
     mask = offs < n_elements                         # ≈ if(i<n) 的向量版
 
-    x      = tl.load(x_ptr + offs)        # 批量读(mask=F 的位置不读)
-    y      = tl.load(y_ptr + offs)
+    x      = tl.load(x_ptr + offs, mask=mask)        # 批量读(mask=F 的位置不读)
+    y      = tl.load(y_ptr + offs, mask=mask)
     output = x + y                                   # NumPy 风格:整块相加
-    tl.store(output_ptr + offs, output)   # 批量写(mask=F 的位置不写)
+    tl.store(output_ptr + offs, output, mask=mask)   # 批量写(mask=F 的位置不写)
 
 # ───────── CPU 侧:launcher(≈ main() 的六步骨架,现在只剩三行)─────────
 def add(x, y, BLOCK_SIZE=1024, verbose=True):
     output = torch.empty_like(x)                     # ≈ cudaMalloc(free 交给 GC)
     n = output.numel()
-    grid = (n//BLOCK_SIZE,)             # ≈ (N + B-1)//B 向上取整,一模一样
+    grid = (triton.cdiv(n, BLOCK_SIZE),)             # ≈ (N + B-1)//B 向上取整,一模一样
     if verbose:
         print(f"  N={n:>9}  BLOCK={BLOCK_SIZE:>5}  grid={grid[0]:>4} programs")
     add_kernel[grid](x, y, output, n, BLOCK_SIZE=BLOCK_SIZE)  # ≈ kernel<<<grid>>>(...)
