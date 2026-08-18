@@ -1,5 +1,6 @@
 *.out
 *.o
+settings.json
 hello
 bool_sum
 pointer_demo
